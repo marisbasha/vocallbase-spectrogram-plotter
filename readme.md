@@ -6,10 +6,10 @@ Spectrogram plotter for annotated audio files. Takes a single audio file + CSV a
 
 ```bash
 # Basic usage - group by individual and age, sorted by age
-python3 sp_annotated.py ZF.wav --csv ZFVocalizations.csv --group-by individual,age --sort-by age
+python3 sp.py ZF.wav --csv ZFVocalizations.csv --group-by individual,age --sort-by age
 
 # Output to specific file
-python3 sp_annotated.py ZF.wav --csv annotations.csv --group-by individual,age -o my_plot.png
+python3 sp.py ZF.wav --csv annotations.csv --group-by individual,age -o my_plot.png
 ```
 
 ## Example Files Used
@@ -117,64 +117,64 @@ The script was developed and tested with:
 
 ### Group by individual + age (zebra finch style)
 ```bash
-python3 sp_annotated.py ZF.wav --csv ZFVocalizations.csv \
+python3 sp.py ZF.wav --csv ZFVocalizations.csv \
     --group-by individual,age --sort-by age
 ```
 Output: Rows labeled "R3277 (99 dph)", "R3280 (38 dph)", etc.
 
 ### Group by category/cluster
 ```bash
-python3 sp_annotated.py audio.wav --csv vocs.csv \
+python3 sp.py audio.wav --csv vocs.csv \
     --group-by clustername --sort-by clustername
 ```
 
 ### Group by species
 ```bash
-python3 sp_annotated.py recording.wav --csv annotations.csv \
+python3 sp.py recording.wav --csv annotations.csv \
     --group-by species --sort-by onset
 ```
 
 ### Custom label format
 ```bash
-python3 sp_annotated.py ZF.wav --csv ann.csv \
+python3 sp.py ZF.wav --csv ann.csv \
     --group-by individual,age \
     --label-format "{individual} at {age} days old"
 ```
 
 ### Different CSV column names
 ```bash
-python3 sp_annotated.py audio.wav --csv data.csv \
+python3 sp.py audio.wav --csv data.csv \
     --onset-col start_time --offset-col end_time \
     --min-freq-col freq_low --max-freq-col freq_high
 ```
 
 ### High-resolution SVG output
 ```bash
-python3 sp_annotated.py audio.wav --csv ann.csv \
+python3 sp.py audio.wav --csv ann.csv \
     --group-by category --format svg --fig-width 16
 ```
 
 ### Show only highlight bars (no frequency boxes)
 ```bash
-python3 sp_annotated.py audio.wav --csv ann.csv \
+python3 sp.py audio.wav --csv ann.csv \
     --group-by individual --no-boxes
 ```
 
 ### Show vertical onset/offset lines
 ```bash
-python3 sp_annotated.py audio.wav --csv ann.csv \
+python3 sp.py audio.wav --csv ann.csv \
     --group-by category --show-vlines --no-boxes
 ```
 
 ### Adjust frequency range and duration
 ```bash
-python3 sp_annotated.py audio.wav --csv ann.csv \
+python3 sp.py audio.wav --csv ann.csv \
     --group-by individual --fmax 15000 --max-duration 3.0
 ```
 
 ### Different colormap
 ```bash
-python3 sp_annotated.py audio.wav --csv ann.csv \
+python3 sp.py audio.wav --csv ann.csv \
     --group-by category --cmap viridis
 ```
 
