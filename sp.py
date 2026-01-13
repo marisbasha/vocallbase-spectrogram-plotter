@@ -1,42 +1,44 @@
+#!/usr/bin/env python3
+"""
+Spectrogram plotter for annotated audio files.
+
+Takes a single audio file + CSV annotations and creates a multi-row spectrogram grid,
+grouping by any column(s) in the CSV and showing all annotations with frequency boxes.
+
+Example usage:
+    python sp_annotated.py ZF.wav --csv annotations.csv --group-by individual,age
+    python sp_annotated.py audio.wav --csv vocs.csv --group-by category --sort-by onset
+"""
+
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import random
-import re
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
-import cmocean
 import colorcet as cc
 import librosa
 import librosa.display
 import matplotlib
-import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
-from skimage.transform import resize
 
 matplotlib.rcParams.update({
-    "svg.fonttype": "path",
-    "figure.figsize": (5, 5),
-    "figure.dpi": 300,
-    "xtick.labelsize": 20,
-    "ytick.labelsize": 20,
-    "font.size": 20,
+    "svg.fonttype": "none",
+    "text.usetex": False,
+    "figure.dpi": 150,
+    "font.size": 12,
     "font.weight": "bold",
     "xtick.direction": "in",
     "ytick.direction": "in",
     "xtick.top": False,
-    "ytick.right": False
+    "ytick.right": False,
 })
 
 
-def resolve_cmap(cmap: Union[str, matplotlib.colors.Colormap]) -> matplotlib.colors.Colormap:
-    if isinstance(cmap, matplotlib.colors.Colormap):
-        return cmap
+def resolve_cmap(cmap: str):
+    """Resolve colormap by name from matplotlib or colorcet."""
     try:
         return matplotlib.colormaps.get_cmap(cmap)
     except Exception:
@@ -45,790 +47,563 @@ def resolve_cmap(cmap: Union[str, matplotlib.colors.Colormap]) -> matplotlib.col
         return getattr(cc.cm, cmap)
     except Exception:
         pass
-    try:
-        return getattr(cmocean.cm, cmap)
-    except Exception:
-        pass
-    return matplotlib.colormaps.get_cmap('viridis')
+    return matplotlib.colormaps.get_cmap("viridis")
 
 
-def _min_max_norm(im: np.ndarray, vmin: Optional[float] = None, vmax: Optional[float] = None) -> np.ndarray:
-    if vmin is None:
-        vmin = np.percentile(im, 0.01)
-    if vmax is None:
-        vmax = np.percentile(im, 99.99)
-    denom = max(vmax - vmin, 1e-12)
-    return np.clip((im - vmin) / denom, 0.0, 1.0)
+def detect_delimiter(csv_path: str) -> str:
+    """Auto-detect CSV delimiter."""
+    with open(csv_path, "r") as f:
+        first_line = f.readline()
+        return "\t" if "\t" in first_line else ","
 
 
-def find_audio_and_csv(
-    folder: str,
-    csv_name: Optional[str] = None,
-    recursive: bool = False,
-    csv_suffix: str = "_new.csv"
-) -> Tuple[List[str], Optional[str]]:
-    if not os.path.isdir(folder):
-        raise FileNotFoundError(f"Folder not found: {folder}")
-    wavs, csvs = [], []
-    search_path = os.walk(folder) if recursive else [(folder, [], os.listdir(folder))]
-    for root, _, files in search_path:
-        for f in files:
-            fp = os.path.join(root, f)
-            fl = f.lower()
-            if fl.endswith(".wav"):
-                wavs.append(fp)
-            elif fl.endswith(csv_suffix.lower()):
-                csvs.append(fp)
-    wavs.sort(key=lambda p: os.path.basename(p).lower())
-    if csv_name:
-        chosen_csv = csv_name if os.path.isabs(csv_name) else os.path.join(folder, csv_name)
-        if not os.path.isfile(chosen_csv):
-            raise FileNotFoundError(f"Specified CSV file not found: {chosen_csv}")
-        return wavs, chosen_csv
-    preferred = [c for c in csvs if "annotation" in os.path.basename(c).lower()]
-    return wavs, (preferred[0] if preferred else (csvs[0] if csvs else None))
+def make_group_label(row: pd.Series, group_cols: List[str], label_format: Optional[str] = None) -> str:
+    """
+    Create a label for a group from the specified columns.
+
+    If label_format is provided, use it as a format string.
+    Otherwise, auto-format based on column names.
+    """
+    if label_format:
+        return label_format.format(**row.to_dict())
+
+    parts = []
+    for col in group_cols:
+        val = row[col]
+        # Special formatting for known column types
+        if col.lower() == "age":
+            parts.append(f"({val} dph)")
+        elif col.lower() in ("individual", "bird", "subject"):
+            parts.append(str(val))
+        elif col.lower() in ("category", "clustername", "class", "type"):
+            parts.append(str(val))
+        else:
+            parts.append(str(val))
+
+    return " ".join(parts)
 
 
-def estimate_common_freq_bounds(audio_files: List[str]) -> Tuple[float, float]:
-    if not audio_files:
-        return 0.0, 8000.0
-    min_nyquist = float('inf')
-    for f in audio_files:
-        try:
-            sr = librosa.get_samplerate(f)
-        except Exception:
-            _, sr = librosa.load(f, sr=None, mono=True)
-        if sr:
-            min_nyquist = min(min_nyquist, sr / 2.0)
-    return 0.0, min_nyquist if min_nyquist != float('inf') else 8000.0
-
-
-def _balanced_pack_rows(durations: Sequence[float], rows: int) -> List[List[int]]:
-    N = len(durations)
-    if rows <= 0:
-        return [[]]
-    if rows >= N:
-        return [[i] for i in range(N)]
-
-    indexed_durations = sorted(enumerate(durations), key=lambda x: x[1], reverse=True)
-    packed = [[] for _ in range(rows)]
-    row_time = [0.0] * rows
-    for original_index, duration in indexed_durations:
-        lightest_row = min(range(rows), key=lambda r: row_time[r])
-        packed[lightest_row].append(original_index)
-        row_time[lightest_row] += duration
-    return packed
-
-
-def _get_crop_window(
+def plot_annotated_spectrogram(
     audio_file: str,
-    df_annotation: Optional[pd.DataFrame],
-    padding_ms: float = 200.0,
-    target_sr: Optional[int] = None,
-) -> Tuple[float, float]:
-    start_time, end_time = 0.0, 0.0
-    found_annotation = False
-    if df_annotation is not None and {"filename", "onset", "offset"}.issubset(df_annotation.columns):
-        base = os.path.basename(audio_file)
-        base_no_ext = os.path.splitext(base)[0]
-        matches = df_annotation[
-            df_annotation["filename"].astype(str).str.contains(base, regex=False, case=False) |
-            df_annotation["filename"].astype(str).str.contains(base_no_ext, regex=False, case=False)
-        ]
-        if matches.empty:
-            indiv_csv = os.path.splitext(audio_file)[0] + "_new.csv"
-            if os.path.exists(indiv_csv):
-                try:
-                    matches = pd.read_csv(indiv_csv)
-                except Exception:
-                    matches = pd.DataFrame()
-        if not matches.empty and {"onset", "offset"}.issubset(matches.columns):
-            min_onset = float(matches["onset"].min())
-            max_offset = float(matches["offset"].max())
-            padding_secs = padding_ms / 1000.0
-            start_time = max(0.0, min_onset - padding_secs)
-            end_time = max_offset + padding_secs
-            found_annotation = True
-    if not found_annotation:
-        try:
-            end_time = librosa.get_duration(path=audio_file)
-        except Exception:
-            y, sr = librosa.load(audio_file, sr=target_sr)
-            end_time = len(y) / sr if sr > 0 else 0.0
-    return start_time, end_time
-
-
-def _parse_aspect(s: str) -> float:
-    if ":" in s or "x" in s.lower():
-        sep = ":" if ":" in s else "x"
-        a, b = s.lower().split(sep)
-        return float(a) / float(b)
-    return float(s)
-
-
-def compute_spectrogram(
-    y: np.ndarray,
-    sr: int,
-    n_fft: int,
-    hop_length: int,
-    center: bool,
-    win_length: Optional[int],
-    window: str,
-    spec_type: str,
-    n_mels: int,
-    fmin: float,
-    fmax: float,
-    ref_db_max: bool = True
-) -> Tuple[np.ndarray, float]:
-    S = librosa.stft(y=y, n_fft=n_fft, hop_length=hop_length, center=center, win_length=win_length, window=window)
-    power_spec = np.abs(S) ** 2
-
-    if spec_type == "mel":
-        if fmax is None or fmax <= 0:
-            fmax = sr / 2
-        melfb = librosa.filters.mel(sr=sr, n_mels=n_mels, n_fft=n_fft, fmin=fmin or 0.0, fmax=fmax)
-        mel_spec = np.matmul(melfb, power_spec)
-        db_spec = librosa.power_to_db(mel_spec, ref=np.max if ref_db_max else 1.0)
-    else:
-        db_spec = librosa.power_to_db(power_spec, ref=np.max if ref_db_max else 1.0)
-
-    duration_sec = (db_spec.shape[1] * hop_length) / sr
-    return db_spec, duration_sec
-
-
-def parse_bird_from_filename(path: str) -> str:
-    base_no_ext = os.path.splitext(os.path.basename(path))[0]
-    return base_no_ext.split("_")[0] if "_" in base_no_ext else base_no_ext
-
-
-def parse_age_from_filename(path: str, hatch_dates: Dict[str, int]) -> Optional[int]:
-    base = os.path.basename(path)
-    m = re.search(r'^(?P<bird>[A-Za-z]\d+)[_\-](?P<date>\d+)', base)
-    if not m:
-        return None
-    bird = m.group("bird")
-    date_num = int(m.group("date"))
-    if bird in hatch_dates:
-        return date_num - int(hatch_dates[bird])
-    return None
-
-
-def plot_auto_grid(
-    audio_files: List[str],
-    annotation_csv: Optional[str],
+    csv_file: str,
+    output: str,
     *,
-    # Spectrogram controls
-    spec_type: str = "linear",  # "linear" or "mel"
-    n_mels: int = 128,
-    n_fft: int = 2048,
-    hop_length: Optional[int] = None,
-    win_length: Optional[int] = None,
-    window: str = "hann",
-    center: bool = True,
-    ref_db_max: bool = True,
-    db_floor: float = -80.0,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-    # Frequency/display
-    fmin: Optional[float] = None,
-    fmax: Optional[float] = None,
-    force_common_freq_bounds: bool = True,
-    y_axis: str = "linear",  # "linear" or "mel" (display only)
-    # Layout
-    rows: Optional[int] = None,  # override row count
-    gap: Union[float, Tuple[float, float]] = (0.2, 1.0),
-    seed: Optional[int] = 0,
-    time_zoom: float = 1.0,
-    target_aspect: float = 9 / 16,
-    target_sr: Optional[int] = None,
-    # Sorting
-    sort_by: Optional[str] = None,  # 'age','filename','duration','random'
+    # Grouping and sorting
+    group_by: Optional[List[str]] = None,
+    sort_by: Optional[str] = None,
     sort_ascending: bool = True,
-    # Titles
-    title_mode: str = "bird_dph",  # "bird","bird_dph","basename","none"
+    label_format: Optional[str] = None,
+    # CSV column mapping
+    onset_col: str = "onset",
+    offset_col: str = "offset",
+    min_freq_col: str = "minFrequency",
+    max_freq_col: str = "maxFrequency",
+    filename_col: str = "filename",
+    # Time/display
+    max_duration: float = 2.0,
+    padding: float = 0.1,
+    # Spectrogram
+    n_fft: int = 512,
+    hop_length: int = 64,
+    target_sr: Optional[int] = None,
+    fmin: float = 0.0,
+    fmax: Optional[float] = None,
+    db_floor: float = -80.0,
+    db_ceil: float = 0.0,
+    # Annotation boxes
+    show_boxes: bool = True,
+    box_color: str = "white",
+    box_linewidth: float = 0.5,
+    box_linestyle: str = "--",
+    # Highlight bars
+    show_highlight: bool = True,
+    highlight_color: str = "green",
+    highlight_linewidth: float = 3.0,
+    highlight_y: float = 1.02,
+    # Vertical lines (onset/offset markers)
+    show_vlines: bool = False,
+    vline_color: str = "white",
+    vline_linewidth: float = 0.7,
+    vline_linestyle: str = ":",
+    # Title/labels
     title_color: str = "white",
     title_bg: str = "black",
+    title_fontsize: float = 11,
     show_titles: bool = True,
-    # Waveform
-    plot_waveform: bool = False,
-    waveform_color: str = "black",
-    waveform_height_ratio: float = 0.3,
-    # Annotations
-    show_annotations: bool = True,
-    annotation_color: str = "black",
-    annotation_box_style: str = "auto",  # "auto","brackets","boxes"
-    annotation_expand_mode: str = "callmark",  # "none","expand","callmark"
-    # Add highlight options
-    annotation_highlight: bool = False,
-    annotation_highlight_color: str = "green",
-    annotation_highlight_lw: float = 4.0,
-    annotation_highlight_y: float = 1.02,
-    # Gaps/background
-    gap_color: Union[str, Tuple[float, float, float]] = "white",
-    # Color mapping
-    cmap: Union[str, matplotlib.colors.Colormap] = "CET_L20",
-    # Colorbar
-    show_colorbar: bool = True,
+    # Figure
+    row_height: float = 2.5,
+    fig_width: float = 12.0,
     # Scalebar
     scalebar_sec: float = 0.5,
-    scalebar_pos: str = "right",  # "right" or "left"
+    scalebar_pos: str = "right",
+    # Colorbar
+    show_colorbar: bool = True,
+    # Style
+    cmap: str = "CET_L20",
+    gap_color: str = "white",
     # Output
-    save_file_name: str = "plot.png",
-    dpi: int = 300,
+    output_format: str = "png",
+    dpi: int = 150,
     transparent: bool = False,
-    # Age/Hatch date
-    hatch_dates: Optional[Dict[str, int]] = None
-) -> None:
-    assert spec_type in ("linear", "mel")
-    assert y_axis in ("linear", "mel")
-    assert annotation_expand_mode in ("none", "expand", "callmark")
-    assert annotation_box_style in ("auto", "brackets", "boxes")
-    assert scalebar_pos in ("right", "left")
+) -> str:
+    """
+    Create a multi-row spectrogram plot from an annotated audio file.
 
-    if not audio_files:
-        raise ValueError("No audio files provided.")
+    Parameters
+    ----------
+    audio_file : str
+        Path to the audio file (.wav)
+    csv_file : str
+        Path to the CSV annotation file
+    output : str
+        Output file path
+    group_by : list of str, optional
+        Column(s) to group annotations by. Each unique combination gets its own row.
+        Example: ["individual", "age"] creates rows like "R3277 (99 dph)"
+    sort_by : str, optional
+        Column to sort groups by. Use "onset" to sort by first appearance,
+        or any column name like "age", "individual", etc.
+    sort_ascending : bool
+        Sort direction (default True = ascending)
+    label_format : str, optional
+        Custom format string for row labels. Use {column_name} placeholders.
+        Example: "{individual} - {age} days" -> "R3277 - 99 days"
+    onset_col, offset_col : str
+        Column names for onset/offset times (in seconds)
+    min_freq_col, max_freq_col : str
+        Column names for frequency bounds (in Hz)
+    filename_col : str
+        Column name for filename (used to filter if CSV has multiple files)
+    max_duration : float
+        Maximum duration per row in seconds
+    padding : float
+        Padding around annotations in seconds
+    n_fft : int
+        FFT window size
+    hop_length : int
+        Hop length for STFT
+    target_sr : int, optional
+        Resample audio to this sample rate
+    fmin, fmax : float
+        Frequency display range (Hz). fmax defaults to Nyquist/2.
+    db_floor, db_ceil : float
+        dB range for colormap
+    show_boxes : bool
+        Draw frequency boxes around annotations
+    show_highlight : bool
+        Draw colored bars above annotations
+    show_vlines : bool
+        Draw vertical lines at onset/offset times
+    show_titles : bool
+        Show group labels above each row
+    scalebar_sec : float
+        Length of scale bar in seconds (0 to hide)
+    show_colorbar : bool
+        Show colorbar
+    cmap : str
+        Colormap name (matplotlib, colorcet, or cmocean)
+    output_format : str
+        Output format (png, svg, pdf)
+    dpi : int
+        Output DPI
+    transparent : bool
+        Transparent background
 
-    rng = random.Random(seed)
-    cmap_resolved = resolve_cmap(cmap)
-    df_annotation = pd.read_csv(annotation_csv) if (annotation_csv and os.path.isfile(annotation_csv)) else None
+    Returns
+    -------
+    str
+        Path to the saved output file
+    """
+    # Load CSV
+    delimiter = detect_delimiter(csv_file)
+    df = pd.read_csv(csv_file, sep=delimiter)
 
-    # SR and STFT params
-    sr0 = librosa.get_samplerate(audio_files[0])
-    final_sr = target_sr if target_sr else sr0
-    hop_length = hop_length if hop_length is not None else max(1, n_fft // 16)
-    win_length = win_length if win_length is not None else None  # librosa will default to n_fft if None
+    # Check required columns
+    required = [onset_col, offset_col]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Required column '{col}' not found in CSV. Available: {list(df.columns)}")
 
-    # Ages (optional)
-    hatch_dates = hatch_dates or {}
+    # Filter by filename if the column exists and audio file matches
+    audio_basename = os.path.basename(audio_file)
+    if filename_col in df.columns:
+        # Keep rows where filename matches (case-insensitive, partial match)
+        mask = df[filename_col].astype(str).str.lower().str.contains(audio_basename.lower(), regex=False)
+        if mask.any():
+            df = df[mask].copy()
 
-    # Crop windows and metadata
-    clip_metadata = []
-    for f in audio_files:
-        s, e = _get_crop_window(f, df_annotation, padding_ms=200.0, target_sr=final_sr)
-        meta = {
-            "path": f, "start_sec": s, "end_sec": e, "duration": e - s,
-            "dph": parse_age_from_filename(f, hatch_dates),
-            "bird": parse_bird_from_filename(f)
-        }
-        clip_metadata.append(meta)
+    # Load audio
+    y_full, sr = librosa.load(audio_file, sr=target_sr, mono=True)
+    if target_sr is None:
+        target_sr = sr
 
-    # Sorting
-    indices = list(range(len(audio_files)))
-    if sort_by == "age":
-        indices.sort(key=lambda i: (clip_metadata[i]["dph"] is None, clip_metadata[i]["dph"], clip_metadata[i]["bird"]))
-    elif sort_by == "filename":
-        indices.sort(key=lambda i: os.path.basename(clip_metadata[i]["path"]).lower())
-    elif sort_by == "duration":
-        indices.sort(key=lambda i: clip_metadata[i]["duration"])
-    elif sort_by == "random":
-        rng.shuffle(indices)
+    # Default fmax to reasonable value
+    if fmax is None:
+        fmax = min(20000, target_sr // 2)
+
+    # Determine grouping
+    if group_by is None:
+        # No grouping - show all annotations in one row
+        df["_group"] = "all"
+        group_cols = ["_group"]
     else:
-        # default: stable by filename
-        indices.sort(key=lambda i: os.path.basename(clip_metadata[i]["path"]).lower())
+        group_cols = group_by
+        for col in group_cols:
+            if col not in df.columns:
+                raise ValueError(f"Group column '{col}' not found in CSV. Available: {list(df.columns)}")
 
-    if not sort_ascending:
-        indices = list(reversed(indices))
+    # Create group labels
+    group_key_cols = group_cols.copy()
 
-    clip_metadata = [clip_metadata[i] for i in indices]
-    audio_files = [audio_files[i] for i in indices]
+    # Get unique groups with their first occurrence info for sorting
+    groups_info = []
+    for _, group_df in df.groupby(group_cols, sort=False):
+        first_row = group_df.iloc[0]
+        label = make_group_label(first_row, group_cols, label_format)
+        groups_info.append({
+            "label": label,
+            "df": group_df,
+            "first_onset": group_df[onset_col].min(),
+            **{col: first_row[col] for col in group_cols}
+        })
 
-    durations = [m["duration"] for m in clip_metadata]
-
-    # Row packing
-    if len(audio_files) > 1:
-        TARGET_ASPECT_RATIO = float(target_aspect)
-        WIDTH_MULTIPLIER = 2.0 * float(time_zoom)
-        HEIGHT_PER_ROW = 4.0
-        avg_gap = (gap[0] + gap[1]) / 2 if isinstance(gap, tuple) else float(gap)
-        best_rows = 1
-        min_cost = float("inf")
-        for r in range(1, len(audio_files) + 1):
-            packed_indices = _balanced_pack_rows(durations, r)
-            row_widths_sec = [sum(durations[i] for i in row) + (len(row) - 1) * avg_gap for row in packed_indices if row]
-            if not row_widths_sec:
-                continue
-            max_duration_sec = max(row_widths_sec)
-            est_plot_width = max_duration_sec * WIDTH_MULTIPLIER
-            est_plot_height = r * HEIGHT_PER_ROW
-            if est_plot_height <= 0:
-                continue
-            current_aspect = est_plot_width / est_plot_height
-            cost = abs(current_aspect - TARGET_ASPECT_RATIO)
-            if cost < min_cost:
-                min_cost = cost
-                best_rows = r
-        effective_rows = rows if (rows and rows > 0) else best_rows
-    else:
-        effective_rows = 1
-
-    row_indices = _balanced_pack_rows(durations, rows=effective_rows)
-    effective_rows = len(row_indices)
-
-    # Gaps per row
-    if isinstance(gap, tuple):
-        all_row_gaps = [[rng.uniform(*gap) for _ in range(len(r) - 1)] for r in row_indices]
-    else:
-        all_row_gaps = [[float(gap) for _ in range(len(r) - 1)] for r in row_indices]
-
-    # Frequency bounds
-    if force_common_freq_bounds or fmin is None or fmax is None:
-        auto_fmin, auto_fmax = estimate_common_freq_bounds(audio_files)
-        fmin = auto_fmin if fmin is None else fmin
-        fmax = auto_fmax if fmax is None else fmax
-    if fmax is not None:
-        # ensure <= Nyquist of final_sr
-        fmax = min(fmax, final_sr / 2.0)
-
-    # Compute specs per clip
-    all_specs_data = []
-    for meta in clip_metadata:
-        y, sr = librosa.load(
-            meta["path"], sr=final_sr, mono=True,
-            offset=meta["start_sec"], duration=meta["duration"]
-        )
-        db_spec, spec_duration = compute_spectrogram(
-            y=y, sr=sr, n_fft=n_fft, hop_length=hop_length, center=center,
-            win_length=win_length, window=window, spec_type=spec_type,
-            n_mels=n_mels, fmin=fmin or 0.0, fmax=fmax or (sr / 2.0), ref_db_max=ref_db_max
-        )
-        all_specs_data.append({"raw_spec": db_spec, "duration": spec_duration})
-
-    # Global min/max for colormap
-    global_max = 0.0 if ref_db_max else (vmax if vmax is not None else None)
-    global_min = db_floor if vmin is None else vmin
-
-    # Row assembly
-    num_freq_bins = all_specs_data[0]["raw_spec"].shape[0] if all_specs_data else (1 + n_fft // 2)
-    row_final_data = []
-    max_row_duration = 0.0
-    for r_num, indices_in_row in enumerate(row_indices):
-        row_parts, time_cursor = [], 0.0
-        gaps_in_row = all_row_gaps[r_num]
-        for j, idx in enumerate(indices_in_row):
-            data = all_specs_data[idx]
-            row_parts.append(data["raw_spec"])
-            time_cursor += data["duration"]
-            if j < len(gaps_in_row):
-                gap_sec = gaps_in_row[j]
-                gap_cols = max(1, int(round(gap_sec * final_sr / hop_length)))
-                gap_spec = np.full((num_freq_bins, gap_cols), global_min - 20)
-                row_parts.append(gap_spec)
-                time_cursor += gap_sec
-        full_row_spec = np.hstack(row_parts) if row_parts else np.full((num_freq_bins, 1), global_min - 20)
-        row_final_data.append({'spec': full_row_spec, 'duration': time_cursor, 'indices': indices_in_row})
-        max_row_duration = max(max_row_duration, time_cursor)
-
-    # Figure sizing
-    TARGET_ASPECT_RATIO = float(target_aspect)
-    min_height = max(4.0, 2.6 * effective_rows)
-    fig_width_by_time = max(14.0, max_row_duration * 2.0 * float(time_zoom))
-    fig_width = max(fig_width_by_time, TARGET_ASPECT_RATIO * min_height)
-    fig_height = fig_width / TARGET_ASPECT_RATIO
-
-    # Axes creation
-    if plot_waveform:
-        total_rows = effective_rows * 2
-        fig, axes = plt.subplots(nrows=total_rows, ncols=1, figsize=(fig_width, fig_height * (1 + waveform_height_ratio)), sharex=True, dpi=dpi)
-    else:
-        fig, axes = plt.subplots(nrows=effective_rows, ncols=1, figsize=(fig_width, fig_height), sharey=True, squeeze=False, dpi=dpi)
-    axes = axes.flatten()
-    fig.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.12, hspace=0.35)
-
-    # Annotation timing adjustment
-    half_window_sec = ((win_length if win_length is not None else n_fft) / (2.0 * final_sr))
-    callmark_shift_sec = ((n_fft - hop_length) / 2.0) / final_sr
-    # For librosa center=True, display x-axis already matches center-of-frame; we typically prefer expand mode
-
-    # Y-axis display type
-    display_y_axis = "mel" if y_axis == "mel" else "linear"
-
-    # Plot rows
-    for r in range(effective_rows):
-        if plot_waveform:
-            ax_wave = axes[2 * r]
-            ax_spec = axes[2 * r + 1]
+    # Sort groups
+    if sort_by:
+        if sort_by == "onset":
+            groups_info.sort(key=lambda x: x["first_onset"], reverse=not sort_ascending)
+        elif sort_by in df.columns:
+            # Try numeric sort first, fall back to string
+            def sort_key(x):
+                val = x.get(sort_by, x["label"])
+                try:
+                    return (0, float(val))
+                except (ValueError, TypeError):
+                    return (1, str(val))
+            groups_info.sort(key=sort_key, reverse=not sort_ascending)
         else:
-            ax_spec = axes[r]
+            groups_info.sort(key=lambda x: x["label"], reverse=not sort_ascending)
 
-        # Waveform
-        if plot_waveform:
-            time_cursor = 0.0
-            for j, idx in enumerate(row_final_data[r]['indices']):
-                meta = clip_metadata[idx]
-                y_full, sr = librosa.load(meta["path"], sr=final_sr, mono=True, offset=meta["start_sec"], duration=meta["duration"])
-                times = np.linspace(0, len(y_full) / sr, len(y_full), endpoint=False)
-                ax_wave.plot(times + time_cursor, y_full, color=waveform_color, lw=0.8)
-                time_cursor += meta["duration"]
-                if j < len(all_row_gaps[r]):
-                    time_cursor += all_row_gaps[r][j]
-            ax_wave.set_xlim(0, max_row_duration)
-            ax_wave.set_ylim(-1, 1)
-            ax_wave.axis("off")
+    n_rows = len(groups_info)
+    if n_rows == 0:
+        raise ValueError("No groups found in CSV")
 
-        # Spectrogram
-        ax_spec.set_facecolor(gap_color)
-        for spine in ax_spec.spines.values():
+    print(f"Plotting {n_rows} groups")
+
+    # Figure setup
+    fig_height = max(4.0, row_height * n_rows)
+    fig, axes = plt.subplots(
+        nrows=n_rows, ncols=1,
+        figsize=(fig_width, fig_height),
+        sharey=True, squeeze=False, dpi=dpi
+    )
+    axes = axes.flatten()
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.95, bottom=0.08, hspace=0.35)
+
+    cmap_resolved = resolve_cmap(cmap)
+
+    # Check if we have frequency columns
+    has_freq = min_freq_col in df.columns and max_freq_col in df.columns
+
+    for i, group_info in enumerate(groups_info):
+        ax = axes[i]
+        ax.set_facecolor(gap_color)
+        for spine in ax.spines.values():
             spine.set_visible(False)
-        ax_spec.set_xlim(0, max_row_duration)
 
-        row_data = row_final_data[r]
-        full_row_spec = row_data['spec']
+        group_df = group_info["df"]
+        label = group_info["label"]
 
+        # Find time range for this group
+        chunk_start = group_df[onset_col].min() - padding
+        chunk_end = group_df[offset_col].max() + padding
+
+        # Limit duration
+        if chunk_end - chunk_start > max_duration:
+            chunk_end = chunk_start + max_duration
+            # Filter annotations to this range
+            group_df = group_df[
+                (group_df[onset_col] >= chunk_start - padding) &
+                (group_df[offset_col] <= chunk_end + padding)
+            ]
+
+        chunk_start = max(0, chunk_start)
+
+        # Extract audio chunk
+        start_sample = int(chunk_start * target_sr)
+        end_sample = int(chunk_end * target_sr)
+        y_chunk = y_full[start_sample:end_sample]
+
+        if len(y_chunk) < n_fft:
+            print(f"Warning: Chunk too short for group '{label}', skipping")
+            continue
+
+        chunk_duration = len(y_chunk) / target_sr
+
+        # Compute spectrogram
+        S = librosa.stft(y_chunk, n_fft=n_fft, hop_length=hop_length)
+        S_db = librosa.amplitude_to_db(np.abs(S), ref=np.max)
+
+        # Display spectrogram
         librosa.display.specshow(
-            full_row_spec, ax=ax_spec, sr=final_sr, hop_length=hop_length,
-            x_axis='time', y_axis=display_y_axis, fmin=fmin or 0.0, fmax=fmax or (final_sr / 2.0),
-            cmap=cmap_resolved, vmin=global_min, vmax=global_max
+            S_db, ax=ax, sr=target_sr, hop_length=hop_length,
+            x_axis="time", y_axis="linear", fmin=fmin, fmax=fmax,
+            cmap=cmap_resolved, vmin=db_floor, vmax=db_ceil
         )
 
-        # Y ticks
-        if display_y_axis == "linear":
-            if fmin is not None and fmax is not None:
-                custom_ticks = np.linspace(fmin, fmax, num=4, dtype=int)
-                ax_spec.set_yticks(custom_ticks)
-        ax_spec.set_ylabel(None)
+        ax.set_xlim(0, chunk_duration)
+        ax.set_ylim(fmin, fmax)
 
-        # Titles and annotations per segment
-        time_cursor = 0.0
-        indices_in_row = row_data['indices']
-        gaps_in_row = all_row_gaps[r]
-        for j, idx in enumerate(indices_in_row):
-            meta = clip_metadata[idx]
-            data = all_specs_data[idx]
+        # Draw annotations
+        for _, ann in group_df.iterrows():
+            rel_onset = ann[onset_col] - chunk_start
+            rel_offset = ann[offset_col] - chunk_start
 
-            # Title
-            if show_titles:
-                base_no_ext = os.path.splitext(os.path.basename(meta["path"]))[0]
-                bird = meta["bird"]
-                title = ""
-                if title_mode == "none":
-                    title = ""
-                elif title_mode == "bird":
-                    title = f"{bird}"
-                elif title_mode == "bird_dph":
-                    if meta["dph"] is not None:
-                        title = f"{bird} ({meta['dph']})"
-                    else:
-                        title = f"{bird}"
-                elif title_mode == "basename":
-                    title = base_no_ext
-                else:
-                    title = f"{bird}"
+            # Skip if outside visible range
+            if rel_offset < 0 or rel_onset > chunk_duration:
+                continue
 
-                if title:
-                    ax_spec.text(
-                        time_cursor, 1.06, title,
-                        fontsize=20, fontweight="bold",
-                        ha="left", va="bottom", color=title_color,
-                        bbox=dict(facecolor=title_bg, pad=2),
-                        transform=ax_spec.get_xaxis_transform(),
-                        clip_on=False
-                    )
+            # Clip to visible range
+            rel_onset = max(0, rel_onset)
+            rel_offset = min(chunk_duration, rel_offset)
 
-            # Annotations
-            if show_annotations:
-                matches = pd.DataFrame()
-                if df_annotation is not None and all(c in df_annotation.columns for c in ["filename", "onset", "offset"]):
-                    base, base_no_ext = os.path.basename(meta["path"]), os.path.splitext(os.path.basename(meta["path"]))[0]
-                    matches = df_annotation[
-                        df_annotation["filename"].astype(str).str.contains(base, regex=False, case=False) |
-                        df_annotation["filename"].astype(str).str.contains(base_no_ext, regex=False, case=False)
-                    ]
-                if matches.empty and os.path.exists(os.path.splitext(meta["path"])[0] + "_new.csv"):
-                    try:
-                        matches = pd.read_csv(os.path.splitext(meta["path"])[0] + "_new.csv")
-                    except Exception:
-                        matches = pd.DataFrame()
+            # Frequency boxes
+            if show_boxes and has_freq:
+                min_freq = ann[min_freq_col]
+                max_freq = ann[max_freq_col]
+                if pd.notna(min_freq) and pd.notna(max_freq):
+                    rect_x = [rel_onset, rel_offset, rel_offset, rel_onset, rel_onset]
+                    rect_y = [min_freq, min_freq, max_freq, max_freq, min_freq]
+                    ax.plot(rect_x, rect_y, color=box_color,
+                           linewidth=box_linewidth, linestyle=box_linestyle)
 
-                if not matches.empty and {"onset", "offset"}.issubset(matches.columns):
-                    has_freq_box = {"minFrequency", "maxFrequency"}.issubset(matches.columns)
-                    for _, row in matches.iterrows():
-                        base_onset = float(row["onset"]) - meta["start_sec"] + time_cursor
-                        base_offset = float(row["offset"]) - meta["start_sec"] + time_cursor
+            # Vertical lines
+            if show_vlines:
+                ax.axvline(rel_onset, color=vline_color,
+                          linewidth=vline_linewidth, linestyle=vline_linestyle)
+                ax.axvline(rel_offset, color=vline_color,
+                          linewidth=vline_linewidth, linestyle=vline_linestyle)
 
-                        # Timing mode
-                        if annotation_expand_mode == "expand":
-                            onset = base_onset - half_window_sec
-                            offset = base_offset + half_window_sec
-                        elif annotation_expand_mode == "callmark":
-                            onset = base_onset - callmark_shift_sec
-                            offset = base_offset + callmark_shift_sec
-                        else:  # "none"
-                            onset = base_onset
-                            offset = base_offset
+            # Highlight bar
+            if show_highlight:
+                ax.plot(
+                    [rel_onset, rel_offset], [highlight_y, highlight_y],
+                    color=highlight_color, linewidth=highlight_linewidth,
+                    solid_capstyle="butt",
+                    transform=ax.get_xaxis_transform(), clip_on=False
+                )
 
-                        onset = max(time_cursor, onset)
-                        offset = min(time_cursor + data["duration"], offset)
-                        if not (offset > time_cursor and onset < (time_cursor + data["duration"])):
-                            continue
+        # Y-axis ticks (in kHz)
+        if fmax <= 25000:
+            tick_khz = [0, 5, 10, 20]
+        else:
+            tick_khz = [0, 10, 20, 40]
+        tick_hz = [t * 1000 for t in tick_khz if fmin <= t * 1000 <= fmax]
+        ax.set_yticks(tick_hz)
+        ax.set_yticklabels([str(t // 1000) for t in tick_hz])
+        ax.set_ylabel(None)
+        ax.set_xticks([])
+        ax.set_xlabel(None)
 
-                        # Optional green highlight bar above the axis
-                        if annotation_highlight:
-                            ax_spec.plot(
-                                [onset, offset], [annotation_highlight_y, annotation_highlight_y],
-                                color=annotation_highlight_color, linewidth=annotation_highlight_lw,
-                                transform=ax_spec.get_xaxis_transform(), clip_on=False
-                            )
+        # Title
+        if show_titles and label != "all":
+            ax.text(
+                0, 1.06, label,
+                fontsize=title_fontsize, fontweight="bold",
+                ha="left", va="bottom", color=title_color,
+                bbox=dict(facecolor=title_bg, pad=2),
+                transform=ax.get_xaxis_transform(),
+                clip_on=False
+            )
 
-                        draw_boxes = annotation_box_style in ("boxes",) or (annotation_box_style == "auto" and has_freq_box)
-                        if draw_boxes and has_freq_box and pd.notna(row["minFrequency"]) and pd.notna(row["maxFrequency"]):
-                            min_freq = float(row["minFrequency"])
-                            max_freq = float(row["maxFrequency"])
-                            if (fmin is None or max_freq > fmin) and (fmax is None or min_freq < fmax):
-                                rect = patches.Rectangle(
-                                    (onset, min_freq), offset - onset, max_freq - min_freq,
-                                    linewidth=1, linestyle=':', edgecolor='white', facecolor='none'
-                                )
-                                ax_spec.add_patch(rect)
-                        else:
-                            # Brackets on time axis
-                            xform = ax_spec.get_xaxis_transform()
-                            ax_spec.plot([onset, offset], [1.02, 1.02], color=annotation_color, lw=1.5,
-                                         transform=xform, clip_on=False)
-                            ax_spec.plot([onset, onset], [1.02, 1.0 - 0.04], color=annotation_color, lw=1.5,
-                                         transform=xform, clip_on=False)
-                            ax_spec.plot([offset, offset], [1.02, 1.0 - 0.04], color=annotation_color, lw=1.5,
-                                         transform=xform, clip_on=False)
-
-            time_cursor += data["duration"] + (gaps_in_row[j] if j < len(gaps_in_row) else 0)
-
-        ax_spec.set_xticks([])
-        ax_spec.set_xlabel(None)
-
-    fig.supylabel("Frequency (Hz)" if display_y_axis == "linear" else "Mel", fontsize=20, fontweight="bold", x=0.01)
-    last_ax = axes[-1] if axes.size else None
+    # Y-axis label
+    fig.supylabel("Frequency (kHz)", fontsize=12, fontweight="bold", x=0.01)
 
     # Scalebar
-    if scalebar_sec and last_ax is not None:
+    if scalebar_sec > 0:
+        last_ax = axes[-1]
         transform = last_ax.get_xaxis_transform()
-        y = -0.18
+        y_pos = -0.18
+        x_end = last_ax.get_xlim()[1]
         if scalebar_pos == "right":
-            x0 = max_row_duration - scalebar_sec
-            x1 = max_row_duration
+            x_start = x_end - scalebar_sec
         else:
-            x0 = 0.0
-            x1 = scalebar_sec
-        last_ax.plot([x0, x1], [y, y], color='black', lw=4, transform=transform, clip_on=False)
-        last_ax.text((x0 + x1) / 2.0, y - 0.06, f"{scalebar_sec} s", color='black', ha='center', va='top',
-                     fontsize=20, fontweight="bold", transform=transform)
+            x_start = 0
+            x_end = scalebar_sec
+        last_ax.plot([x_start, x_end], [y_pos, y_pos], color="black", lw=3,
+                     transform=transform, clip_on=False, solid_capstyle="butt")
+        last_ax.text((x_start + x_end) / 2, y_pos - 0.06, f"{scalebar_sec} s",
+                     ha="center", va="top", fontsize=10, fontweight="bold",
+                     transform=transform, clip_on=False)
 
     # Colorbar
     if show_colorbar:
-        sm = plt.cm.ScalarMappable(cmap=cmap_resolved, norm=plt.Normalize(vmin=global_min, vmax=global_max))
-        cbar = fig.colorbar(sm, ax=axes, orientation='horizontal', fraction=0.015, pad=0.04)
-        cbar.set_label('Power (dB)', fontsize=20, fontweight="bold")
+        sm = plt.cm.ScalarMappable(cmap=cmap_resolved,
+                                    norm=plt.Normalize(vmin=db_floor, vmax=db_ceil))
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=axes, orientation="horizontal",
+                           fraction=0.015, pad=0.04)
+        cbar.set_label("Power (dB)", fontsize=10, fontweight="bold")
 
-    plt.savefig(save_file_name, pad_inches=0.2, transparent=transparent)
-    plt.close(fig)
+    # Save
+    plt.savefig(output, format=output_format, bbox_inches="tight",
+                dpi=dpi, transparent=transparent)
+    plt.close()
 
-
-def plot_folder(
-    folder: str,
-    *,
-    csv_name: Optional[str] = None,
-    output: Optional[str] = None,
-    recursive: bool = False,
-    csv_suffix: str = "_new.csv",
-    # Forwarded options (subset; see CLI for more)
-    spec_type: str = "linear",
-    n_mels: int = 128,
-    n_fft: int = 2048,
-    hop_length: Optional[int] = None,
-    win_length: Optional[int] = None,
-    window: str = "hann",
-    center: bool = True,
-    ref_db_max: bool = True,
-    db_floor: float = -80.0,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-    fmin: Optional[float] = None,
-    fmax: Optional[float] = None,
-    force_common_freq_bounds: bool = True,
-    y_axis: str = "linear",
-    rows: Optional[int] = None,
-    gap: Union[float, Tuple[float, float]] = (0.2, 1.0),
-    seed: Optional[int] = 0,
-    time_zoom: float = 1.0,
-    target_aspect: float = 9/16,
-    target_sr: Optional[int] = None,
-    sort_by: Optional[str] = None,
-    sort_ascending: bool = True,
-    title_mode: str = "bird_dph",
-    title_color: str = "white",
-    title_bg: str = "black",
-    show_titles: bool = True,
-    plot_waveform: bool = False,
-    waveform_color: str = "black",
-    waveform_height_ratio: float = 0.3,
-    show_annotations: bool = True,
-    annotation_color: str = "black",
-    annotation_box_style: str = "auto",
-    annotation_expand_mode: str = "expand",
-    annotation_highlight: bool = False,
-    annotation_highlight_color: str = "green",
-    annotation_highlight_lw: float = 4.0,
-    annotation_highlight_y: float = 1.02,
-    gap_color: Union[str, Tuple[float, float, float]] = "white",
-    cmap: Union[str, matplotlib.colors.Colormap] = "CET_L20",
-    show_colorbar: bool = True,
-    scalebar_sec: float = 0.5,
-    scalebar_pos: str = "right",
-    output_format: str = "svg",
-    dpi: int = 300,
-    transparent: bool = False,
-    hatch_dates_file: Optional[str] = None,
-    hatch_dates: Optional[Dict[str, int]] = None
-) -> str:
-    audio_files, ann_csv = find_audio_and_csv(folder, csv_name=csv_name, recursive=recursive, csv_suffix=csv_suffix)
-    if not audio_files:
-        raise ValueError(f"No WAV files found in {folder}")
-    if output is None:
-        parent = os.path.abspath(folder)
-        output = os.path.join(parent, f"{os.path.basename(os.path.normpath(folder))}_plot.{output_format}")
-
-    if hatch_dates is None and hatch_dates_file and os.path.isfile(hatch_dates_file):
-        with open(hatch_dates_file, "r") as f:
-            try:
-                hatch_dates = json.load(f)
-            except Exception:
-                hatch_dates = {}
-
-    plot_auto_grid(
-        audio_files=audio_files, annotation_csv=ann_csv,
-        spec_type=spec_type, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length,
-        win_length=win_length, window=window, center=center, ref_db_max=ref_db_max,
-        db_floor=db_floor, vmin=vmin, vmax=vmax, fmin=fmin, fmax=fmax,
-        force_common_freq_bounds=force_common_freq_bounds, y_axis=y_axis,
-        rows=rows, gap=gap, seed=seed, time_zoom=time_zoom, target_aspect=target_aspect,
-        target_sr=target_sr, sort_by=sort_by, sort_ascending=sort_ascending,
-        title_mode=title_mode, title_color=title_color, title_bg=title_bg, show_titles=show_titles,
-        plot_waveform=plot_waveform, waveform_color=waveform_color, waveform_height_ratio=waveform_height_ratio,
-        show_annotations=show_annotations, annotation_color=annotation_color,
-        annotation_box_style=annotation_box_style, annotation_expand_mode=annotation_expand_mode,
-        annotation_highlight=annotation_highlight,
-        annotation_highlight_color=annotation_highlight_color,
-        annotation_highlight_lw=annotation_highlight_lw,
-        annotation_highlight_y=annotation_highlight_y,
-        gap_color=gap_color, cmap=cmap, show_colorbar=show_colorbar, scalebar_sec=scalebar_sec,
-        scalebar_pos=scalebar_pos, save_file_name=output, dpi=dpi, transparent=transparent,
-        hatch_dates=hatch_dates
-    )
+    print(f"Saved: {output}")
     return output
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pack spectrograms into a rectangular, time-true grid with rich controls.",
+        description="Plot spectrograms from annotated audio files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    io = parser.add_argument_group("Input/Output")
-    io.add_argument("folder", help="Folder containing .wav files; optionally an annotation CSV.")
-    io.add_argument("--csv", dest="csv_name", default=None, help="Specific annotation CSV file path or name.")
-    io.add_argument("--csv-suffix", default="_new.csv", help="Per-file CSV suffix to auto-load if master CSV not matched.")
-    io.add_argument("--output", default=None, help="Output image file path.")
-    io.add_argument("--format", default="svg", help="Output file format (e.g., 'png', 'svg', 'pdf').")
-    io.add_argument("--recursive", action="store_true", help="Search for audio files recursively.")
-    io.add_argument("--dpi", type=int, default=300, help="Figure DPI.")
-    io.add_argument("--transparent", action="store_true", help="Save with transparent background.")
+    # Required
+    parser.add_argument("audio", help="Audio file path (.wav)")
+    parser.add_argument("--csv", required=True, help="CSV annotation file path")
 
+    # Grouping/sorting
+    group = parser.add_argument_group("Grouping & Sorting")
+    group.add_argument("--group-by", type=str, default=None,
+                       help="Column(s) to group by, comma-separated (e.g., 'individual,age')")
+    group.add_argument("--sort-by", type=str, default=None,
+                       help="Column to sort groups by (e.g., 'age', 'onset', 'individual')")
+    group.add_argument("--sort-desc", action="store_true",
+                       help="Sort descending instead of ascending")
+    group.add_argument("--label-format", type=str, default=None,
+                       help="Custom label format string (e.g., '{individual} - {age} days')")
+
+    # CSV columns
+    cols = parser.add_argument_group("CSV Column Names")
+    cols.add_argument("--onset-col", default="onset", help="Onset time column name")
+    cols.add_argument("--offset-col", default="offset", help="Offset time column name")
+    cols.add_argument("--min-freq-col", default="minFrequency", help="Min frequency column name")
+    cols.add_argument("--max-freq-col", default="maxFrequency", help="Max frequency column name")
+    cols.add_argument("--filename-col", default="filename", help="Filename column name")
+
+    # Time/display
+    time = parser.add_argument_group("Time & Display")
+    time.add_argument("--max-duration", type=float, default=2.0,
+                      help="Maximum duration per row (seconds)")
+    time.add_argument("--padding", type=float, default=0.1,
+                      help="Padding around annotations (seconds)")
+
+    # Spectrogram
     spec = parser.add_argument_group("Spectrogram")
-    spec.add_argument("--spec-type", choices=["linear", "mel"], default="linear")
-    spec.add_argument("--n-mels", type=int, default=128)
-    spec.add_argument("--n-fft", type=int, default=2048)
-    spec.add_argument("--hop-length", type=int, default=None)
-    spec.add_argument("--win-length", type=int, default=None)
-    spec.add_argument("--window", type=str, default="hann")
-    spec.add_argument("--center", action="store_true", default=True)
-    spec.add_argument("--no-center", dest="center", action="store_false")
-    spec.add_argument("--ref-db-max", action="store_true", default=True, help="Reference dB to max power.")
-    spec.add_argument("--no-ref-db-max", dest="ref_db_max", action="store_false")
-    spec.add_argument("--db-floor", type=float, default=-80.0, help="Display floor for dB.")
-    spec.add_argument("--vmin", type=float, default=None, help="Override display vmin.")
-    spec.add_argument("--vmax", type=float, default=None, help="Override display vmax.")
-    spec.add_argument("--target-sr", type=int, default=None, help="Resample all audio to this sample rate.")
-    spec.add_argument("--fmin", type=float, default=None)
-    spec.add_argument("--fmax", type=float, default=None)
-    spec.add_argument("--force-common-freq-bounds", action="store_true", default=True)
-    spec.add_argument("--no-force-common-freq-bounds", dest="force_common_freq_bounds", action="store_false")
-    spec.add_argument("--y-axis", choices=["linear", "mel"], default="linear")
+    spec.add_argument("--n-fft", type=int, default=512, help="FFT window size")
+    spec.add_argument("--hop-length", type=int, default=64, help="Hop length")
+    spec.add_argument("--target-sr", type=int, default=None, help="Resample to this sample rate")
+    spec.add_argument("--fmin", type=float, default=0.0, help="Minimum frequency (Hz)")
+    spec.add_argument("--fmax", type=float, default=None, help="Maximum frequency (Hz)")
+    spec.add_argument("--db-floor", type=float, default=-80.0, help="dB floor")
+    spec.add_argument("--db-ceil", type=float, default=0.0, help="dB ceiling")
 
-    layout = parser.add_argument_group("Layout")
-    layout.add_argument("--rows", type=int, default=None, help="Override number of rows (auto if None).")
-    layout.add_argument("--gap", type=float, default=None, help="Fixed gap in seconds (overrides --gap-range).")
-    layout.add_argument("--gap-range", type=float, nargs=2, default=[0.2, 1.0], help="Random gap range (min max) in seconds.")
-    layout.add_argument("--seed", type=int, default=0, help="Random seed for gap sampling and random sort.")
-    layout.add_argument("--time-zoom", type=float, default=1.0, help="Multiply horizontal space per second.")
-    layout.add_argument("--aspect", type=str, default="9:16", help="Target aspect ratio, e.g. '9:16' or '1.777'.")
+    # Annotations
+    ann = parser.add_argument_group("Annotation Display")
+    ann.add_argument("--no-boxes", dest="show_boxes", action="store_false",
+                     help="Hide frequency boxes")
+    ann.add_argument("--box-color", default="white", help="Frequency box color")
+    ann.add_argument("--box-linewidth", type=float, default=0.5, help="Box line width")
+    ann.add_argument("--box-linestyle", default="--", help="Box line style")
+    ann.add_argument("--no-highlight", dest="show_highlight", action="store_false",
+                     help="Hide highlight bars")
+    ann.add_argument("--highlight-color", default="green", help="Highlight bar color")
+    ann.add_argument("--highlight-linewidth", type=float, default=3.0, help="Highlight line width")
+    ann.add_argument("--show-vlines", action="store_true",
+                     help="Show vertical lines at onset/offset")
+    ann.add_argument("--vline-color", default="white", help="Vertical line color")
 
-    sort = parser.add_argument_group("Sorting")
-    sort.add_argument("--sort-by", choices=["age", "filename", "duration", "random"], default=None)
-    sort.add_argument("--sort-desc", action="store_true", help="Sort descending instead of ascending.")
-
-    style = parser.add_argument_group("Style")
-    style.add_argument("--cmap", default="CET_L20", help="Colormap name (matplotlib/colorcet/cmocean).")
-    style.add_argument("--gap-color", default="white", help="Background/gap color.")
-    style.add_argument("--show-colorbar", action="store_true", default=True)
-    style.add_argument("--no-colorbar", dest="show_colorbar", action="store_false")
-
+    # Titles
     titles = parser.add_argument_group("Titles")
-    titles.add_argument("--title-mode", choices=["bird", "bird_dph", "basename", "none"], default="bird")
-    titles.add_argument("--title-color", default="white")
-    titles.add_argument("--title-bg", default="black")
-    titles.add_argument("--no-titles", dest="show_titles", action="store_false")
+    titles.add_argument("--no-titles", dest="show_titles", action="store_false",
+                        help="Hide row titles")
+    titles.add_argument("--title-color", default="white", help="Title text color")
+    titles.add_argument("--title-bg", default="black", help="Title background color")
+    titles.add_argument("--title-fontsize", type=float, default=11, help="Title font size")
 
-    waves = parser.add_argument_group("Waveform")
-    waves.add_argument("--waveform", action="store_true", default=False)
-    waves.add_argument("--waveform-color", default="black")
-    waves.add_argument("--waveform-height-ratio", type=float, default=0.3)
+    # Figure
+    fig = parser.add_argument_group("Figure")
+    fig.add_argument("--row-height", type=float, default=2.5, help="Height per row (inches)")
+    fig.add_argument("--fig-width", type=float, default=12.0, help="Figure width (inches)")
+    fig.add_argument("--scalebar-sec", type=float, default=0.5,
+                     help="Scale bar length in seconds (0 to hide)")
+    fig.add_argument("--scalebar-pos", choices=["left", "right"], default="right",
+                     help="Scale bar position")
+    fig.add_argument("--no-colorbar", dest="show_colorbar", action="store_false",
+                     help="Hide colorbar")
 
-    ann = parser.add_argument_group("Annotations")
-    ann.add_argument("--show-annotations", action="store_true", default=True)
-    ann.add_argument("--no-annotations", dest="show_annotations", action="store_false")
-    ann.add_argument("--annotation-color", default="black")
-    ann.add_argument("--annotation-style", choices=["auto", "brackets", "boxes"], default="auto")
-    ann.add_argument("--annotation-expand-mode", choices=["none", "expand", "callmark"], default="callmark",
-                     help="'expand' pads annotations by ±half-window; 'callmark' uses (n_fft - hop)/2; 'none' leaves untouched.")
-    ann.add_argument("--annotation-highlight", action="store_true", default=True,
-                     help="Draw a colored bar above each annotation window.")
-    ann.add_argument("--annotation-highlight-color", default="green")
-    ann.add_argument("--annotation-highlight-lw", type=float, default=4.0)
-    ann.add_argument("--annotation-highlight-y", type=float, default=1.02,
-                     help="Vertical position in axes fraction units (1.0 is top).")
+    # Style
+    style = parser.add_argument_group("Style")
+    style.add_argument("--cmap", default="CET_L20", help="Colormap name")
+    style.add_argument("--gap-color", default="white", help="Background color")
 
-    scale = parser.add_argument_group("Scalebar")
-    scale.add_argument("--scalebar-sec", type=float, default=0.5)
-    scale.add_argument("--scalebar-pos", choices=["left", "right"], default="right")
-
-    age = parser.add_argument_group("Age/Hatch Dates")
-    age.add_argument("--hatch-dates-json", default=None, help="JSON file with bird->hatch_date mapping (serial date ints).")
+    # Output
+    out = parser.add_argument_group("Output")
+    out.add_argument("--output", "-o", default=None, help="Output file path")
+    out.add_argument("--format", default="png", help="Output format (png, svg, pdf)")
+    out.add_argument("--dpi", type=int, default=150, help="Output DPI")
+    out.add_argument("--transparent", action="store_true", help="Transparent background")
 
     args = parser.parse_args()
 
-    gap_spec = args.gap if args.gap is not None else tuple(sorted(args.gap_range))
-    target_aspect = _parse_aspect(args.aspect)
+    # Parse group-by
+    group_by = None
+    if args.group_by:
+        group_by = [col.strip() for col in args.group_by.split(",")]
 
-    output_path = plot_folder(
-        folder=args.folder, csv_name=args.csv_name, output=args.output, recursive=args.recursive,
-        csv_suffix=args.csv_suffix, spec_type=args.spec_type, n_mels=args.n_mels, n_fft=args.n_fft,
-        hop_length=args.hop_length, win_length=args.win_length, window=args.window, center=args.center,
-        ref_db_max=args.ref_db_max, db_floor=args.db_floor, vmin=args.vmin, vmax=args.vmax,
-        fmin=args.fmin, fmax=args.fmax, force_common_freq_bounds=args.force_common_freq_bounds,
-        y_axis=args.y_axis, rows=args.rows, gap=gap_spec, seed=args.seed, time_zoom=args.time_zoom,
-        target_aspect=target_aspect, target_sr=args.target_sr, sort_by=args.sort_by,
-        sort_ascending=not args.sort_desc, title_mode=args.title_mode, title_color=args.title_color,
-        title_bg=args.title_bg, show_titles=args.show_titles, plot_waveform=args.waveform,
-        waveform_color=args.waveform_color, waveform_height_ratio=args.waveform_height_ratio,
-        show_annotations=args.show_annotations, annotation_color=args.annotation_color,
-        annotation_box_style=args.annotation_style, annotation_expand_mode=args.annotation_expand_mode,
-        annotation_highlight=args.annotation_highlight,
-        annotation_highlight_color=args.annotation_highlight_color,
-        annotation_highlight_lw=args.annotation_highlight_lw,
-        annotation_highlight_y=args.annotation_highlight_y,
-        gap_color=args.gap_color, cmap=args.cmap, show_colorbar=args.show_colorbar,
-        scalebar_sec=args.scalebar_sec, scalebar_pos=args.scalebar_pos, output_format=args.format,
-        dpi=args.dpi, transparent=args.transparent, hatch_dates_file=args.hatch_dates_json
+    # Default output path
+    output = args.output
+    if output is None:
+        base = os.path.splitext(os.path.basename(args.audio))[0]
+        output = f"{base}_annotated.{args.format}"
+
+    plot_annotated_spectrogram(
+        audio_file=args.audio,
+        csv_file=args.csv,
+        output=output,
+        group_by=group_by,
+        sort_by=args.sort_by,
+        sort_ascending=not args.sort_desc,
+        label_format=args.label_format,
+        onset_col=args.onset_col,
+        offset_col=args.offset_col,
+        min_freq_col=args.min_freq_col,
+        max_freq_col=args.max_freq_col,
+        filename_col=args.filename_col,
+        max_duration=args.max_duration,
+        padding=args.padding,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        target_sr=args.target_sr,
+        fmin=args.fmin,
+        fmax=args.fmax,
+        db_floor=args.db_floor,
+        db_ceil=args.db_ceil,
+        show_boxes=args.show_boxes,
+        box_color=args.box_color,
+        box_linewidth=args.box_linewidth,
+        box_linestyle=args.box_linestyle,
+        show_highlight=args.show_highlight,
+        highlight_color=args.highlight_color,
+        highlight_linewidth=args.highlight_linewidth,
+        show_vlines=args.show_vlines,
+        vline_color=args.vline_color,
+        show_titles=args.show_titles,
+        title_color=args.title_color,
+        title_bg=args.title_bg,
+        title_fontsize=args.title_fontsize,
+        row_height=args.row_height,
+        fig_width=args.fig_width,
+        scalebar_sec=args.scalebar_sec,
+        scalebar_pos=args.scalebar_pos,
+        show_colorbar=args.show_colorbar,
+        cmap=args.cmap,
+        gap_color=args.gap_color,
+        output_format=args.format,
+        dpi=args.dpi,
+        transparent=args.transparent,
     )
-    print(f"Plot successfully saved to: {output_path}")
 
 
 if __name__ == "__main__":
